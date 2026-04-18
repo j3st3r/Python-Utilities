@@ -3,9 +3,8 @@
 """
   Written by: Will Armijo <will.armijo@gmail.com>
   Script Name: Local_dns_sniffer.py
-  Purpose: A live self-refreshing HTML page system resource dashboard
-  Usage: Open web browser and nvigate to, http://localhost:8080
-  Prerequires: pip install psutil
+  Purpose: displays all dns traffic
+  Usage: python3 Local_dns_sniffer.py
 """
 
 import argparse
