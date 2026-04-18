@@ -3,8 +3,8 @@
 """
   Written by: Will Armijo <will.armijo@gmail.com>
   Script Name: full_traffic_sniffer.py 
-  Purpose: A live self-refreshing HTML page system resource dashboard
-  Usage: Open web browser and nvigate to, http://localhost:8080
+  Purpose: displays all traffic between client and server services.
+  Usage: python3 full_traffic_sniffer.py
   Prerequires: pip install psutil
 """
 
