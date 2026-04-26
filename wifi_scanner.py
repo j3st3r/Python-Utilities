@@ -1,21 +1,37 @@
+import asyncio
+import json
+import threading
+import websockets
 from scapy.all import sniff, Dot11Beacon, Dot11, Dot11Elt, RadioTap, conf
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+import os, pathlib
 
 conf.use_pcap = True
 
-found_bssids = set()
-
 CHANNEL_TO_FREQ = {
-    # 2.4 GHz (channels 1–14)
     **{ch: round(2.407 + 0.005 * ch, 3) for ch in range(1, 14)},
     14: 2.484,
-    # 5 GHz (channels 36–177)
     **{ch: round(5.000 + 0.005 * ch, 3) for ch in range(36, 178, 4)},
-    # 6 GHz (channels 1–233, Wi-Fi 6E)
     **{ch: round(5.950 + 0.005 * ch, 3) for ch in range(1, 234, 4)},
 }
 
+found_bssids = {}
+clients      = set()
+loop         = None
+paused       = False
+
+# ── HTTP server ───────────────────────────────────────────────
+class QuietHandler(SimpleHTTPRequestHandler):
+    def log_message(self, *args): pass
+
+def run_http_server():
+    os.chdir(pathlib.Path(__file__).parent)
+    server = HTTPServer(('localhost', 9000), QuietHandler)
+    print("[http] Dashboard at http://localhost:9000/dashboard.html")
+    server.serve_forever()
+
+# ── Packet parsing helpers ────────────────────────────────────
 def get_channel(pkt):
-    """Extract channel from DS Parameter Set element (ID 3)."""
     try:
         elt = pkt.getlayer(Dot11Elt)
         while elt:
@@ -27,18 +43,15 @@ def get_channel(pkt):
     return None
 
 def get_frequency(channel):
-    """Map channel number to GHz frequency string."""
     if channel is None:
-        return "?"
-    freq = CHANNEL_TO_FREQ.get(channel)
-    return f"{freq:.3f}" if freq else "?"
+        return None
+    return CHANNEL_TO_FREQ.get(channel)
 
 def get_encryption(pkt):
-    """Detect encryption: WPA2 (RSN IE), WPA (vendor IE), WEP, or Open."""
-    cap = pkt[Dot11Beacon].cap
+    cap     = pkt[Dot11Beacon].cap
     has_rsn = False
     has_wpa = False
-    elt = pkt.getlayer(Dot11Elt)
+    elt     = pkt.getlayer(Dot11Elt)
     while elt:
         if elt.ID == 48:
             has_rsn = True
@@ -46,35 +59,46 @@ def get_encryption(pkt):
         if elt.ID == 221 and elt.info[:4] == b'\x00\x50\xf2\x01':
             has_wpa = True
         elt = elt.payload.getlayer(Dot11Elt)
-    if has_rsn:
-        return "WPA2"
-    elif has_wpa:
-        return "WPA"
-    elif cap.privacy:
-        return "WEP"
+    if has_rsn:       return "WPA2"
+    elif has_wpa:     return "WPA"
+    elif cap.privacy: return "WEP"
     return "Open"
 
 def get_signal(pkt):
-    """Extract RSSI (dBm) from RadioTap header if present."""
     try:
         if pkt.haslayer(RadioTap):
-            return f"{pkt[RadioTap].dBm_AntSignal} dBm"
+            return int(pkt[RadioTap].dBm_AntSignal)
     except Exception:
         pass
-    return "?"
+    return None
 
+# ── Broadcast helpers ─────────────────────────────────────────
+def broadcast(data):
+    if not clients or loop is None:
+        return
+    asyncio.run_coroutine_threadsafe(_broadcast(json.dumps(data)), loop)
+
+async def _broadcast(msg):
+    dead = set()
+    for ws in clients:
+        try:
+            await ws.send(msg)
+        except Exception:
+            dead.add(ws)
+    clients.difference_update(dead)
+
+# ── Packet handler ────────────────────────────────────────────
 def packet_handler(pkt):
+    if paused:
+        return
+
     if not pkt.haslayer(Dot11Beacon):
         return
 
     bssid = pkt[Dot11].addr2
-    if bssid in found_bssids:
-        return
-    found_bssids.add(bssid)
 
-    # Parse SSID from element ID 0
     ssid = None
-    elt = pkt.getlayer(Dot11Elt)
+    elt  = pkt.getlayer(Dot11Elt)
     while elt:
         if elt.ID == 0:
             try:
@@ -87,30 +111,83 @@ def packet_handler(pkt):
         elt = elt.payload.getlayer(Dot11Elt)
 
     if not ssid:
-        return  # Skip hidden networks
+        return
 
     channel = get_channel(pkt)
-    freq    = get_frequency(channel)
-    enc     = get_encryption(pkt)
-    signal  = get_signal(pkt)
-    ch_str  = str(channel) if channel is not None else "?"
+    is_new  = bssid not in found_bssids
 
-    print(f"  {ssid!r:<32}  {bssid}  {ch_str:>3}  {freq:>9}  {enc:<8}  {signal}")
+    found_bssids[bssid] = {
+        "ssid":    ssid,
+        "bssid":   bssid,
+        "channel": channel,
+        "freq":    get_frequency(channel),
+        "enc":     get_encryption(pkt),
+        "signal":  get_signal(pkt),
+    }
 
-COL_WIDTHS = f"  {'SSID':<32}  {'BSSID':<17}  {'CH':>3}  {'FREQ(GHz)':>9}  {'ENC':<8}  SIGNAL"
-DIVIDER    = "  " + "-" * (len(COL_WIDTHS) - 2)
+    broadcast({
+        "type":    "new" if is_new else "update",
+        "network": found_bssids[bssid],
+        "total":   len(found_bssids),
+    })
 
-print("Starting scan on en0 (requires sudo)...\n")
-print(DIVIDER)
-print(COL_WIDTHS)
-print(DIVIDER)
+# ── WebSocket handler ─────────────────────────────────────────
+async def ws_handler(websocket):
+    global paused
+    clients.add(websocket)
+    print(f"[ws] Client connected ({len(clients)} total)")
 
-try:
-    sniff(iface="en0", prn=packet_handler, monitor=True, timeout=30)
-except PermissionError:
-    print("Error: Run with sudo.")
-except Exception as e:
-    print(f"Error: {e}")
+    # Send all known networks on connect
+    for net in found_bssids.values():
+        await websocket.send(json.dumps({
+            "type": "new", "network": net, "total": len(found_bssids)
+        }))
 
-print(DIVIDER)
-print(f"\nScan complete. Found {len(found_bssids)} unique network(s).")
+    # Sync current pause state to newly connected client
+    await websocket.send(json.dumps({"type": "state", "paused": paused}))
+
+    try:
+        async for raw in websocket:
+            try:
+                msg = json.loads(raw)
+                cmd = msg.get("cmd")
+                if cmd == "pause":
+                    paused = True
+                    print("[ws] Scan paused by client")
+                    await _broadcast(json.dumps({"type": "state", "paused": True}))
+                elif cmd == "resume":
+                    paused = False
+                    print("[ws] Scan resumed by client")
+                    await _broadcast(json.dumps({"type": "state", "paused": False}))
+            except Exception:
+                pass
+    finally:
+        clients.discard(websocket)
+        print(f"[ws] Client disconnected ({len(clients)} total)")
+
+# ── WebSocket server ──────────────────────────────────────────
+async def run_ws_server():
+    global loop
+    loop = asyncio.get_running_loop()
+    print("[ws]   WebSocket on ws://localhost:8765")
+    async with websockets.serve(ws_handler, "localhost", 8765):
+        await asyncio.Future()
+
+# ── Scanner thread ────────────────────────────────────────────
+def run_scanner():
+    print("[scan] Scanning on en0 (requires sudo)...")
+    try:
+        sniff(iface="en0", prn=packet_handler, monitor=True, store=False)
+    except PermissionError:
+        print("[scan] Error: run with sudo.")
+    except Exception as e:
+        print(f"[scan] Error: {e}")
+
+# ── Entry point ───────────────────────────────────────────────
+if __name__ == "__main__":
+    threading.Thread(target=run_http_server, daemon=True).start()
+    threading.Thread(target=run_scanner,     daemon=True).start()
+    try:
+        asyncio.run(run_ws_server())
+    except KeyboardInterrupt:
+        print("\n[*] Shutting down.")
